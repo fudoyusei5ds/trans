@@ -1,0 +1,12 @@
+[package]
+name = "gfx_test"
+version = "0.1.0"
+authors = ["fudoYusei <tangjiawei1997@sina.com>"]
+edition = "2018"
+
+[dependencies]
+winit = "0.18"
+glsl-to-spirv = "0.1.6"
+gfx-hal = "0.1"
+gfx-backend-empty = "0.1"
+gfx-backend-vulkan = "0.1"
