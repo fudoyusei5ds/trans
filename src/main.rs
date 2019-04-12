@@ -26,12 +26,12 @@ use gfx_hal::{
 use winit::{Event, EventsLoop, KeyboardInput, VirtualKeyCode, WindowBuilder, WindowEvent};
 
 fn main() {
-    // Create a window with winit.
+    // 用winit创建窗口
     let mut events_loop = EventsLoop::new();
 
     let window = WindowBuilder::new()
         .with_title("Part 00: Triangle")
-        .with_dimensions((256, 256).into())
+        .with_dimensions((800, 600).into())
         .build(&events_loop)
         .unwrap();
 
@@ -64,11 +64,11 @@ fn main() {
 
     // A command pool is used to acquire command buffers - which are used to
     // send drawing instructions to the GPU.
-    let max_buffers = 16;
-    let mut command_pool = device.create_command_pool_typed(
-        &queue_group,
-        CommandPoolCreateFlags::empty(),
-    ).unwrap();
+    let mut command_pool = unsafe {
+        device.create_command_pool_typed(
+            &queue_group,
+            CommandPoolCreateFlags::empty(),)
+    }.expect("Can't create command pool");
 
     // We want to get the capabilities (`caps`) of the surface, which tells us what
     // parameters we can use for our swapchain later. We also get a list of supported
@@ -118,34 +118,42 @@ fn main() {
                 ..(Access::COLOR_ATTACHMENT_READ | Access::COLOR_ATTACHMENT_WRITE),
         };
 
-        device.create_render_pass(&[color_attachment], &[subpass], &[dependency]).unwrap()
+        unsafe {
+            device.create_render_pass(&[color_attachment], &[subpass], &[dependency])
+        }.unwrap()
     };
 
     // The pipeline layout defines the shape of the data you can send to a shader.
     // This includes the number of uniforms and push constants. We don't need them
     // for now.
-    let pipeline_layout = device.create_pipeline_layout(&[], &[]).unwrap();
+    let pipeline_layout = unsafe {
+        device.create_pipeline_layout(&[], &[])
+    }.unwrap();
 
     // Shader modules are needed to create a pipeline definition.
     // The shader is loaded from SPIR-V binary files.
     let vertex_shader_module = {
-        let glsl = fs::read_to_string("./part00.vert").unwrap();
+        let glsl = fs::read_to_string("/home/tet/test_sets/workspace/aboarpython/gfx_test/src/part00.vert").unwrap();
         let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Vertex)
                 .unwrap()
                 .bytes()
                 .map(|b| b.unwrap())
                 .collect();
-        device.create_shader_module(&spirv).unwrap()
+        unsafe {
+            device.create_shader_module(&spirv)
+        }.unwrap()
     };
 
     let fragment_shader_module = {
-        let glsl = fs::read_to_string("./part00.frag").unwrap();
+        let glsl = fs::read_to_string("/home/tet/test_sets/workspace/aboarpython/gfx_test/src/part00.frag").unwrap();
             let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Fragment)
                 .unwrap()
                 .bytes()
                 .map(|b| b.unwrap())
                 .collect();
-        device.create_shader_module(&spirv).unwrap()
+        unsafe {
+            device.create_shader_module(&spirv)
+        }.unwrap()
     };
 
     // A pipeline object encodes almost all the state you need in order to draw
@@ -190,9 +198,9 @@ fn main() {
             .targets
             .push(ColorBlendDesc(ColorMask::ALL, BlendState::ALPHA));
 
-        device
-            .create_graphics_pipeline(&pipeline_desc, None)
-            .unwrap()
+        unsafe {
+            device.create_graphics_pipeline(&pipeline_desc, None)
+        }.unwrap()
     };
 
     // Initialize our swapchain, images, framebuffers, etc.
@@ -218,7 +226,9 @@ fn main() {
 
     let extent = swap_config.extent.to_extent();
 
-    let (mut swapchain, backbuffer) = device.create_swapchain(&mut surface, swap_config, None).unwrap();
+    let (mut swapchain, backbuffer) = unsafe {
+        device.create_swapchain(&mut surface, swap_config, None)
+    }.unwrap();
 
     // You can think of an image as just the raw binary of the literal image, with
     // additional metadata about the format.
@@ -246,24 +256,24 @@ fn main() {
             let image_views = images
                 .iter()
                 .map(|image| {
-                    device
-                        .create_image_view(
+                    unsafe {
+                        device.create_image_view(
                             image,
                             ViewKind::D2,
                             surface_color_format,
                             Swizzle::NO,
                             color_range.clone(),
                         )
-                        .unwrap()
+                    }.unwrap()
                 })
                 .collect::<Vec<_>>();
 
             let fbos = image_views
                 .iter()
                 .map(|image_view| {
-                    device
-                        .create_framebuffer(&render_pass, vec![image_view], extent)
-                        .unwrap()
+                    unsafe {
+                        device.create_framebuffer(&render_pass, vec![image_view], extent)
+                    }.unwrap()
                 })
                 .collect();
 
@@ -311,34 +321,35 @@ fn main() {
         }
 
         // Start rendering
-
-        command_pool.reset();
+        unsafe {
+            command_pool.reset();
+        }
 
         // A swapchain contains multiple images - which one should we draw on? This
         // returns the index of the image we'll use. The image may not be ready for
         // rendering yet, but will signal frame_semaphore when it is.
-        let frame_index: SwapImageIndex = swapchain
-            .acquire_image(!0, FrameSync::Semaphore(&frame_semaphore))
-            .expect("Failed to acquire frame");
+        let frame_index: SwapImageIndex = unsafe {
+            swapchain.acquire_image(!0, FrameSync::Semaphore(&frame_semaphore))
+        }.expect("Failed to acquire frame");
 
         // We have to build a command buffer before we send it off to draw.
         // We don't technically have to do this every frame, but if it needs to
         // change every frame, then we do.
-        let finished_command_buffer = {
-            let mut command_buffer = command_pool.acquire_command_buffer();
+        let mut command_buffer = command_pool.acquire_command_buffer::<gfx_hal::command::MultiShot>();
 
-            // Define a rectangle on screen to draw into.
-            // In this case, the whole screen.
-            let viewport = Viewport {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    w: extent.width as i16,
-                    h: extent.height as i16,
-                },
-                depth: 0.0..1.0,
-            };
+        // Define a rectangle on screen to draw into.
+        // In this case, the whole screen.
+        let viewport = Viewport {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: extent.width as i16,
+                h: extent.height as i16,
+            },
+            depth: 0.0..1.0,
+        };
 
+        unsafe {
             command_buffer.set_viewports(0, &[viewport.clone()]);
             command_buffer.set_scissors(0, &[viewport.rect]);
 
@@ -367,57 +378,57 @@ fn main() {
 
             // Finish building the command buffer - it's now ready to send to the
             // GPU.
-            command_buffer.finish()
-        };
+            command_buffer.finish();
 
-        // This is what we submit to the command queue. We wait until frame_semaphore
-        // is signalled, at which point we know our chosen image is available to draw
-        // on.
-        let submission = Submission::new()
-            .wait_on(&[(&frame_semaphore, PipelineStage::BOTTOM_OF_PIPE)])
-            .signal(&[&present_semaphore])
-            .submit(vec![finished_command_buffer]);
-        
-        let submission = Submission {
-            command_buffers: 
+            // This is what we submit to the command queue. We wait until frame_semaphore
+            // is signalled, at which point we know our chosen image is available to draw
+            // on.
+            let submission = Submission {
+                command_buffers: Some(&command_buffer),
+                wait_semaphores: Some((&frame_semaphore, PipelineStage::BOTTOM_OF_PIPE)),
+                signal_semaphores: Some(&present_semaphore),
+            };
+
+            // We submit the submission to one of our command queues, which will signal
+            // frame_fence once rendering is completed.
+            
+            queue_group.queues[0].submit(submission, None);
+
+            // We first wait for the rendering to complete...
+            // TODO: Fix up for semaphores
+
+            // ...and then present the image on screen!
+            swapchain
+                .present(
+                    &mut queue_group.queues[0],
+                    frame_index,
+                    vec![&present_semaphore],
+                )
+                .expect("Present failed");
         }
-
-        // We submit the submission to one of our command queues, which will signal
-        // frame_fence once rendering is completed.
-        queue_group.queues[0].submit(submission, None);
-
-        // We first wait for the rendering to complete...
-        // TODO: Fix up for semaphores
-
-        // ...and then present the image on screen!
-        swapchain
-            .present(
-                &mut queue_group.queues[0],
-                frame_index,
-                vec![&present_semaphore],
-            )
-            .expect("Present failed");
     }
 
     // Cleanup
-    device.destroy_graphics_pipeline(pipeline);
-    device.destroy_pipeline_layout(pipeline_layout);
+    unsafe {
+        device.destroy_graphics_pipeline(pipeline);
+        device.destroy_pipeline_layout(pipeline_layout);
 
-    for framebuffer in framebuffers {
-        device.destroy_framebuffer(framebuffer);
+        for framebuffer in framebuffers {
+            device.destroy_framebuffer(framebuffer);
+        }
+
+        for image_view in frame_views {
+            device.destroy_image_view(image_view);
+        }
+
+        device.destroy_render_pass(render_pass);
+        device.destroy_swapchain(swapchain);
+
+        device.destroy_shader_module(vertex_shader_module);
+        device.destroy_shader_module(fragment_shader_module);
+        device.destroy_command_pool(command_pool.into_raw());
+
+        device.destroy_semaphore(frame_semaphore);
+        device.destroy_semaphore(present_semaphore);
     }
-
-    for image_view in frame_views {
-        device.destroy_image_view(image_view);
-    }
-
-    device.destroy_render_pass(render_pass);
-    device.destroy_swapchain(swapchain);
-
-    device.destroy_shader_module(vertex_shader_module);
-    device.destroy_shader_module(fragment_shader_module);
-    device.destroy_command_pool(command_pool.into_raw());
-
-    device.destroy_semaphore(frame_semaphore);
-    device.destroy_semaphore(present_semaphore);
 }
