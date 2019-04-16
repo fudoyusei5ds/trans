@@ -1,434 +1,282 @@
 extern crate gfx_backend_vulkan as backend;
-extern crate gfx_hal;
+extern crate gfx_hal as hal;
 extern crate winit;
+extern crate image;
 
-use std::fs;
-use std::io::{Read};
+const DIMS: hal::window::Extent2D = hal::window::Extent2D { width: 800,height: 600 };
+const ENTRY_NAME: &str = "main";
 
-use gfx_hal::{
-    command::{ClearColor, ClearValue},
-    format::{Aspects, ChannelType, Format, Swizzle},
-    image::{Access, Layout, SubresourceRange, ViewKind},
-    pass::{
-        Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDependency,
-        SubpassDesc, SubpassRef,
-    },
-    pool::CommandPoolCreateFlags,
-    pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, GraphicsPipelineDesc, GraphicsShaderSet,
-        PipelineStage, Rasterizer, Rect, Viewport,
-    },
-    queue::Submission,
-    Backbuffer, Device, FrameSync, Graphics, Instance, Primitive, Surface, SwapImageIndex,
-    Swapchain, SwapchainConfig,
-};
+use hal::Instance;
+use hal::adapter::PhysicalDevice;
+use hal::window::Surface;
+use hal::device::Device;
+use hal::pso::DescriptorPool;
+use hal::format::AsFormat;
 
-use winit::{Event, EventsLoop, KeyboardInput, VirtualKeyCode, WindowBuilder, WindowEvent};
+// 顶点结构体
+#[derive(Debug, Clone, Copy)]
+struct Vertex {
+    a_Pos: [f32; 2],
+    a_Uv: [f32; 2],
+}
+
+// 在这里指定顶点的坐标
+const QUAD: [Vertex; 6] = [
+    Vertex { a_Pos: [ -0.5, 0.33 ], a_Uv: [0.0, 1.0] },
+    Vertex { a_Pos: [  0.5, 0.33 ], a_Uv: [1.0, 1.0] },
+    Vertex { a_Pos: [  0.5,-0.33 ], a_Uv: [1.0, 0.0] },
+
+    Vertex { a_Pos: [ -0.5, 0.33 ], a_Uv: [0.0, 1.0] },
+    Vertex { a_Pos: [  0.5,-0.33 ], a_Uv: [1.0, 0.0] },
+    Vertex { a_Pos: [ -0.5,-0.33 ], a_Uv: [0.0, 0.0] },
+];
 
 fn main() {
-    // 用winit创建窗口
-    let mut events_loop = EventsLoop::new();
+    // 首先创建一个物理窗口
+    let mut events_loop = winit::EventsLoop::new();
+    let window = winit::WindowBuilder::new()
+        .with_dimensions(winit::dpi::LogicalSize::new(
+            DIMS.width as _,
+            DIMS.height as _,
+        ))
+        .with_title("first program".to_string())
+        .build(&events_loop).unwrap();
+    
+    // 接着, 创建一个实例: 实例是API的接口
+    let instance = backend::Instance::create("first quad", 1);
+    // 创建一个表面: 表面是窗口的一种表示
+    let surface = instance.create_surface(&window);
+    // 创建一组适配器: 适配器表示一个物理设备
+    let mut adapters = instance.enumerate_adapters();
+    // 打印适配器的信息, 不知道有什么用
+    for adapter in &adapters {
+        println!("{:?}", adapter.info);
+    }
+    // 然后获取第一个适配器, 我们就用这个适配器来运行程序
+    let mut adapter = adapters.remove(0);
+    // 获取显卡的内存类型, 资源限制
+    let memory_types = adapter.physical_device.memory_properties().memory_types;
+    let limits = adapter.physical_device.limits();
 
-    let window = WindowBuilder::new()
-        .with_title("Part 00: Triangle")
-        .with_dimensions((800, 600).into())
-        .build(&events_loop)
-        .unwrap();
-
-    // Initialize our long-lived graphics state.
-    // We expect these to live for the whole duration of our program.
-
-    // The Instance serves as an entry point to the graphics API. The create method
-    // takes an application name and version - but these aren't important.
-    let instance = backend::Instance::create("Part 00: Triangle", 1);
-
-    // The surface is an abstraction for the OS's native window.
-    let mut surface = instance.create_surface(&window);
-
-    // An adapter represents a physical device - such as a graphics card.
-    // We're just taking the first one available, but you could choose one here.
-    let mut adapter = instance.enumerate_adapters().remove(0);
-
-    // The device is a logical device allowing you to perform GPU operations.
-    // The queue group contains a set of command queues which we can later submit
-    // drawing commands to.
-    //
-    // Here we're requesting 1 queue, with the `Graphics` capability so we can do
-    // rendering. We also pass a closure to choose the first queue family that our
-    // surface supports to allocate queues from. More on queue families in a later
-    // tutorial.
-    let num_queues = 1;
+    // 获取逻辑设备和相关的队列族, 队列族包含至少1个队列, 支持图形能力, 且和surface兼容
     let (device, mut queue_group) = adapter
-        .open_with::<_, Graphics>(num_queues, |family| surface.supports_queue_family(family))
-        .unwrap();
+        .open_with::<_, hal::Graphics>(
+            1, 
+            |family| surface.supports_queue_family(family),
+        ).unwrap();
 
-    // A command pool is used to acquire command buffers - which are used to
-    // send drawing instructions to the GPU.
+    // 创建一个命令池, 命令池是命令缓冲区获取内存的对象. 
+    // 内存本身是隐式并动态分配的, 但如果没有它, 命令缓冲区将没有任何存储空间来保存记录的命令. 
     let mut command_pool = unsafe {
         device.create_command_pool_typed(
-            &queue_group,
-            CommandPoolCreateFlags::empty(),)
-    }.expect("Can't create command pool");
+            &queue_group, 
+            hal::pool::CommandPoolCreateFlags::empty(),
+        )
+    }.expect("Cannot create command pool");
 
-    // We want to get the capabilities (`caps`) of the surface, which tells us what
-    // parameters we can use for our swapchain later. We also get a list of supported
-    // image formats for our surface.
-    let (caps, formats, _present_modes, _composite_alpha) = surface.compatibility(&mut adapter.physical_device);
+    // 设置renderpass和管线
 
-    let surface_color_format = {
-        // We must pick a color format from the list of supported formats. If there
-        // is no list, we default to Rgba8Srgb.
-        match formats {
-            Some(choices) => choices
-                .into_iter()
-                .find(|format| format.base_format().1 == ChannelType::Srgb)
-                .unwrap(),
-            None => Format::Rgba8Srgb,
-        }
-    };
-
-    // A render pass defines which attachments (images) are to be used for what
-    // purposes. Right now, we only have a color attachment for the final output,
-    // but eventually we might have depth/stencil attachments, or even other color
-    // attachments for other purposes.
-    let render_pass = {
-        let color_attachment = Attachment {
-            format: Some(surface_color_format),
-            samples: 1,
-            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
-            stencil_ops: AttachmentOps::DONT_CARE,
-            layouts: Layout::Undefined..Layout::Present,
-        };
-
-        // A render pass could have multiple subpasses - but we're using one for now.
-        let subpass = SubpassDesc {
-            colors: &[(0, Layout::ColorAttachmentOptimal)],
-            depth_stencil: None,
-            inputs: &[],
-            resolves: &[],
-            preserves: &[],
-        };
-
-        // This expresses the dependencies between subpasses. Again, we only have
-        // one subpass for now. Future tutorials may go into more detail.
-        let dependency = SubpassDependency {
-            passes: SubpassRef::External..SubpassRef::Pass(0),
-            stages: PipelineStage::COLOR_ATTACHMENT_OUTPUT..PipelineStage::COLOR_ATTACHMENT_OUTPUT,
-            accesses: Access::empty()
-                ..(Access::COLOR_ATTACHMENT_READ | Access::COLOR_ATTACHMENT_WRITE),
-        };
-
-        unsafe {
-            device.create_render_pass(&[color_attachment], &[subpass], &[dependency])
-        }.unwrap()
-    };
-
-    // The pipeline layout defines the shape of the data you can send to a shader.
-    // This includes the number of uniforms and push constants. We don't need them
-    // for now.
-    let pipeline_layout = unsafe {
-        device.create_pipeline_layout(&[], &[])
+    // 创建一个描述符集合布局
+    // 描述符是一个特殊的不透明的着色器变量, 着色器使用它以间接的方式访问缓冲区和图像资源. 
+    // 描述符集合被称为"集合", 因为它可以引用一组同构资源, 可以用相同的布局绑定(Layout Binding)来描述.
+    let set_layout = unsafe {
+        device.create_descriptor_set_layout(
+            &[
+                hal::pso::DescriptorSetLayoutBinding {
+                    binding: 0,
+                    ty: hal::pso::DescriptorType::SampledImage,
+                    count: 1,
+                    stage_flags: hal::pso::ShaderStageFlags::FRAGMENT,
+                    immutable_samplers: false,
+                },
+                hal::pso::DescriptorSetLayoutBinding {
+                    binding: 1,
+                    ty: hal::pso::DescriptorType::Sampler,
+                    count: 1,
+                    stage_flags: hal::pso::ShaderStageFlags::FRAGMENT,
+                    immutable_samplers: false,
+                },
+            ],
+            &[],
+        )
+    }.expect("Cannot create descriptor set layout");
+    // 创建描述器
+    let mut desc_pool = unsafe {
+        device.create_descriptor_pool(
+            1,
+            &[
+                hal::pso::DescriptorRangeDesc {
+                    ty: hal::pso::DescriptorType::SampledImage,
+                    count: 1,
+                },
+                hal::pso::DescriptorRangeDesc {
+                    ty: hal::pso::DescriptorType::Sampler,
+                    count: 1,
+                },
+            ]
+        )
+    }.expect("Cannot create descriptor pool");
+    // 创建描述器集合
+    let desc_set = unsafe {
+        desc_pool.allocate_set(&set_layout)
     }.unwrap();
 
-    // Shader modules are needed to create a pipeline definition.
-    // The shader is loaded from SPIR-V binary files.
-    let vertex_shader_module = {
-        let glsl = fs::read_to_string("/home/tet/test_sets/workspace/aboarpython/gfx_test/src/part00.vert").unwrap();
-        let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Vertex)
-                .unwrap()
-                .bytes()
-                .map(|b| b.unwrap())
-                .collect();
-        unsafe {
-            device.create_shader_module(&spirv)
-        }.unwrap()
-    };
-
-    let fragment_shader_module = {
-        let glsl = fs::read_to_string("/home/tet/test_sets/workspace/aboarpython/gfx_test/src/part00.frag").unwrap();
-            let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Fragment)
-                .unwrap()
-                .bytes()
-                .map(|b| b.unwrap())
-                .collect();
-        unsafe {
-            device.create_shader_module(&spirv)
-        }.unwrap()
-    };
-
-    // A pipeline object encodes almost all the state you need in order to draw
-    // geometry on screen. For now that's really only which shaders to use, what
-    // kind of blending to do, and what kind of primitives to draw.
-    let pipeline = {
-        let vs_entry = EntryPoint::<backend::Backend> {
-            entry: "main",
-            module: &vertex_shader_module,
-            specialization: Default::default(),
-        };
-
-        let fs_entry = EntryPoint::<backend::Backend> {
-            entry: "main",
-            module: &fragment_shader_module,
-            specialization: Default::default(),
-        };
-
-        let shader_entries = GraphicsShaderSet {
-            vertex: vs_entry,
-            hull: None,
-            domain: None,
-            geometry: None,
-            fragment: Some(fs_entry),
-        };
-
-        let subpass = Subpass {
-            index: 0,
-            main_pass: &render_pass,
-        };
-
-        let mut pipeline_desc = GraphicsPipelineDesc::new(
-            shader_entries,
-            Primitive::TriangleList,
-            Rasterizer::FILL,
-            &pipeline_layout,
-            subpass,
-        );
-
-        pipeline_desc
-            .blender
-            .targets
-            .push(ColorBlendDesc(ColorMask::ALL, BlendState::ALPHA));
-
-        unsafe {
-            device.create_graphics_pipeline(&pipeline_desc, None)
-        }.unwrap()
-    };
-
-    // Initialize our swapchain, images, framebuffers, etc.
-    // We expect to have to rebuild these when the window is resized -
-    // however we're going to ignore that for this example.
-
-    // A swapchain is effectively a chain of images (commonly two) that will be
-    // displayed to the screen. While one is being displayed, we can draw to one
-    // of the others.
-    //
-    // In a rare instance of the API creating resources for you, the backbuffer
-    // contains the actual images that make up the swapchain. We'll create image
-    // views and framebuffers from these next.
-    //
-    // We also want to store the swapchain's extent, which tells us how big each
-    // image is.
-    let swap_config = SwapchainConfig::from_caps(&caps, surface_color_format, 
-            gfx_hal::window::Extent2D {
-                width: 800,
-                height: 600,
-            }
-        );
-
-    let extent = swap_config.extent.to_extent();
-
-    let (mut swapchain, backbuffer) = unsafe {
-        device.create_swapchain(&mut surface, swap_config, None)
+    // 接下来创建顶点缓冲区
+    // 首先为顶点缓冲分配内存
+    println!("Memory types: {:?}", memory_types);
+    // 获取顶点结构体的长度
+    let buffer_stride = std::mem::size_of::<Vertex>() as u64;
+    // 计算顶点缓冲区的大小
+    let buffer_len = QUAD.len() as u64 * buffer_stride;
+    // 断言长度不为0
+    assert_ne!(buffer_len, 0);
+    // 创建顶点缓冲(未绑定内存)
+    let mut vertex_buffer = unsafe {
+        device.create_buffer(
+            buffer_len,
+            hal::buffer::Usage::VERTEX,
+        )
     }.unwrap();
-
-    // You can think of an image as just the raw binary of the literal image, with
-    // additional metadata about the format.
-    //
-    // Accessing the image must be done through an image view - which is more or
-    // less a sub-range of the base image. For example, it could be one 2D slice of
-    // a 3D texture. In many cases, the view will just be of the whole image. You
-    // can also use an image view to swizzle or reinterpret the image format, but
-    // we don't need to do any of this right now.
-    //
-    // Framebuffers bind certain image views to certain attachments. So for example,
-    // if your render pass requires one color, and one depth, attachment - the
-    // framebuffer chooses specific image views for each one.
-    //
-    // Here we create an image view and a framebuffer for each image in our
-    // swapchain.
-    let (frame_views, framebuffers) = match backbuffer {
-        Backbuffer::Images(images) => {
-            let color_range = SubresourceRange {
-                aspects: Aspects::COLOR,
-                levels: 0..1,
-                layers: 0..1,
-            };
-
-            let image_views = images
-                .iter()
-                .map(|image| {
-                    unsafe {
-                        device.create_image_view(
-                            image,
-                            ViewKind::D2,
-                            surface_color_format,
-                            Swizzle::NO,
-                            color_range.clone(),
-                        )
-                    }.unwrap()
-                })
-                .collect::<Vec<_>>();
-
-            let fbos = image_views
-                .iter()
-                .map(|image_view| {
-                    unsafe {
-                        device.create_framebuffer(&render_pass, vec![image_view], extent)
-                    }.unwrap()
-                })
-                .collect();
-
-            (image_views, fbos)
-        }
-
-        // This arm of the branch is currently only used by the OpenGL backend,
-        // which supplies an opaque framebuffer for you instead of giving you control
-        // over individual images.
-        Backbuffer::Framebuffer(fbo) => (vec![], vec![fbo]),
+    // 获取顶点缓冲区所需的内存
+    let buffer_req = unsafe {
+        device.get_buffer_requirements(&vertex_buffer)
     };
-
-    // The frame semaphore is used to allow us to wait for an image to be ready
-    // before attempting to draw on it,
-    //
-    // The frame fence is used to to allow us to wait until our draw commands have
-    // finished before attempting to display the image.
-    let frame_semaphore = device.create_semaphore().unwrap();
-    let present_semaphore = device.create_semaphore().unwrap();
-
-    // Mainloop starts here
-    loop {
-        let mut quitting = false;
-
-        // If the window is closed, or Escape is pressed, quit
-        events_loop.poll_events(|event| {
-            if let Event::WindowEvent { event, .. } = event {
-                match event {
-                    WindowEvent::CloseRequested => quitting = true,
-                    WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => quitting = true,
-                    _ => {}
-                }
+    // 获取可用的内存类型
+    let upload_type: hal::adapter::MemoryTypeId = memory_types
+        .iter()
+        .enumerate()
+        .position(
+            // type_mask是一个位字段, 每位表示一种内存类型
+            // 如果位设置为1, 说明该内存可以用于缓冲区
+            // 因此, 查找第一个位为1, 且对CPU可见的内存类型
+            |(id, mem_type)| {
+                buffer_req.type_mask & (1 << id) != 0
+                   && mem_type.properties.contains(hal::memory::Properties::CPU_VISIBLE)
             }
-        });
-
-        if quitting {
-            break;
-        }
-
-        // Start rendering
-        unsafe {
-            command_pool.reset();
-        }
-
-        // A swapchain contains multiple images - which one should we draw on? This
-        // returns the index of the image we'll use. The image may not be ready for
-        // rendering yet, but will signal frame_semaphore when it is.
-        let frame_index: SwapImageIndex = unsafe {
-            swapchain.acquire_image(!0, FrameSync::Semaphore(&frame_semaphore))
-        }.expect("Failed to acquire frame");
-
-        // We have to build a command buffer before we send it off to draw.
-        // We don't technically have to do this every frame, but if it needs to
-        // change every frame, then we do.
-        let mut command_buffer = command_pool.acquire_command_buffer::<gfx_hal::command::MultiShot>();
-
-        // Define a rectangle on screen to draw into.
-        // In this case, the whole screen.
-        let viewport = Viewport {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: extent.width as i16,
-                h: extent.height as i16,
-            },
-            depth: 0.0..1.0,
-        };
-
-        unsafe {
-            command_buffer.set_viewports(0, &[viewport.clone()]);
-            command_buffer.set_scissors(0, &[viewport.rect]);
-
-            // Choose a pipeline to use.
-            command_buffer.bind_graphics_pipeline(&pipeline);
-
-            {
-                // Clear the screen and begin the render pass.
-                let mut encoder = command_buffer.begin_render_pass_inline(
-                    &render_pass,
-                    &framebuffers[frame_index as usize],
-                    viewport.rect,
-                    &[ClearValue::Color(ClearColor::Float([0.0, 0.0, 0.0, 1.0]))],
-                );
-
-                // Draw some geometry! In this case 0..3 means that we're drawing
-                // the range of vertices from 0 to 3. We have no vertex buffer so
-                // this really just tells our shader to draw one triangle. The
-                // specific vertices to draw are encoded in the vertex shader which
-                // you can see in `source_assets/shaders/part00.vert`.
-                //
-                // The 0..1 is the range of instances to draw. It's not relevant
-                // unless you're using instanced rendering.
-                encoder.draw(0..3, 0..1);
-            }
-
-            // Finish building the command buffer - it's now ready to send to the
-            // GPU.
-            command_buffer.finish();
-
-            // This is what we submit to the command queue. We wait until frame_semaphore
-            // is signalled, at which point we know our chosen image is available to draw
-            // on.
-            let submission = Submission {
-                command_buffers: Some(&command_buffer),
-                wait_semaphores: Some((&frame_semaphore, PipelineStage::BOTTOM_OF_PIPE)),
-                signal_semaphores: Some(&present_semaphore),
-            };
-
-            // We submit the submission to one of our command queues, which will signal
-            // frame_fence once rendering is completed.
-            
-            queue_group.queues[0].submit(submission, None);
-
-            // We first wait for the rendering to complete...
-            // TODO: Fix up for semaphores
-
-            // ...and then present the image on screen!
-            swapchain
-                .present(
-                    &mut queue_group.queues[0],
-                    frame_index,
-                    vec![&present_semaphore],
-                )
-                .expect("Present failed");
-        }
-    }
-
-    // Cleanup
+        ).unwrap().into();
+    // 为缓冲区分配指定类型的内存段
+    let buffer_memory = unsafe {
+        device.allocate_memory(
+            upload_type,
+            buffer_req.size, // 顶点缓冲区的内存大小
+        )
+    }.unwrap();
+    // 把内存绑定到顶点缓冲区
     unsafe {
-        device.destroy_graphics_pipeline(pipeline);
-        device.destroy_pipeline_layout(pipeline_layout);
-
-        for framebuffer in framebuffers {
-            device.destroy_framebuffer(framebuffer);
-        }
-
-        for image_view in frame_views {
-            device.destroy_image_view(image_view);
-        }
-
-        device.destroy_render_pass(render_pass);
-        device.destroy_swapchain(swapchain);
-
-        device.destroy_shader_module(vertex_shader_module);
-        device.destroy_shader_module(fragment_shader_module);
-        device.destroy_command_pool(command_pool.into_raw());
-
-        device.destroy_semaphore(frame_semaphore);
-        device.destroy_semaphore(present_semaphore);
+        device.bind_buffer_memory(
+            &buffer_memory,
+            0,
+            &mut vertex_buffer,
+        )
+    }.unwrap();
+    // 写数据到顶点缓冲区
+    unsafe {
+        // 首先获取一个写入内存的映射
+        let mut vertices = device
+            .acquire_mapping_writer::<Vertex>(&buffer_memory, 0..buffer_req.size)
+            .unwrap();
+        // 然后将顶点复制到映射中
+        vertices[0..QUAD.len()].copy_from_slice(&QUAD);
+        // 释放写映射
+        device.release_mapping_writer(vertices).unwrap();
     }
+
+    // 处理图片, 将图片作为纹理上传到uniform变量中
+    // 首先将图片保存为二进制数据
+    let img_data = include_bytes!("data/logo.png");
+    // 用image模块读取图片
+    let img = image::load(std::io::Cursor::new(&img_data[..]), image::PNG)
+        .unwrap().to_rgba();
+    // 获取图片的宽高
+    let (width, height) = img.dimensions();
+    // 指定将分配的图片的类型
+    let kind = hal::image::Kind::D2( // 二维图像
+        width as u32,
+        height as u32,
+        1,  // 图层数
+        1,  // 采样数
+    );
+    // 获取行对齐掩码, 值为存储在缓冲区中的纹理数据的行间距的对齐(主要用于GPU复制数据)减1
+    let row_alignment_mask = limits.min_buffer_copy_pitch_alignment as u32 - 1;
+    // 这是什么意思?
+    let image_stride = 4usize;
+    // 计算行距
+    let row_pitch = 
+        (width * image_stride as u32 + row_alignment_mask) & !row_alignment_mask;
+    // 计算保存图像的缓冲区的大小
+    let upload_size = (height * row_pitch) as u64;
+    // 创建用于保存图片的缓冲区
+    let mut image_upload_buffer = unsafe {
+        device.create_buffer(
+            upload_size,  
+            hal::buffer::Usage::TRANSFER_SRC    // 该缓冲区用来作为转换源
+        )
+    }.unwrap();
+    // 获取缓冲区需求的内存
+    let image_mem_reqs = unsafe {
+        device.get_buffer_requirements(&image_upload_buffer)
+    };
+    // 为该缓冲区分配内存
+    let image_upload_memory = unsafe {
+        device.allocate_memory(
+            upload_type, 
+            image_mem_reqs.size)
+    }.unwrap();
+    // 然后把内存绑定到缓冲区上
+    unsafe {
+        device.bind_buffer_memory(
+            &image_upload_memory,
+            0,
+            &mut image_upload_buffer,
+        )
+    }.unwrap();
+    // 最后, 把图片的数据复制到现在的缓冲区上
+    unsafe {
+        let mut data = device
+            .acquire_mapping_writer::<u8>(
+                &image_upload_memory,
+                0..image_mem_reqs.size
+            ).unwrap();
+        for y in 0..height as usize {
+            let row = &(*img)
+                [y * (width as usize) * image_stride..(y + 1) * (width as usize) * image_stride];
+            let dest_base = y * row_pitch as usize;
+            data[dest_base..dest_base + row.len()].copy_from_slice(row);
+        }
+        device.release_mapping_writer(data).unwrap();
+    }
+
+    // 下面创建一个纹理
+    // 首先创建一个图片对象
+    let mut image_logo = unsafe {
+        device.create_image(
+            kind,       // 类型
+            1,          // 多级渐远纹理等级
+            hal::format::Rgba8Srgb::SELF,   // 格式
+            hal::image::Tiling::Optimal,            // 过滤方式
+            hal::image::Usage::TRANSFER_DST | 
+                hal::image::Usage::SAMPLED,         // 使用标记
+            hal::image::ViewCapabilities::empty(),  // 不懂
+        )
+    }.unwrap();
+    // 获取该图片对象的内存需求
+    let image_req = unsafe {
+        device.get_image_requirements(&image_logo)
+    };
+    // 获取支持图片对象的设备内存的类型
+    let device_type: hal::adapter::MemoryTypeId = memory_types
+        .iter()
+        .enumerate()
+        .position(|(id, memory_type)| {
+            image_req.type_mask & (1 << id) != 0
+                && memory_type.properties.contains(hal::memory::Properties::CPU_VISIBLE)
+        }).unwrap().into();
+    // 分配内存
+    let image_memory = unsafe {
+        device.allocate_memory(
+            device_type,
+            image_req.size)
+    }.unwrap();
+    // 绑定内存
+    
 }

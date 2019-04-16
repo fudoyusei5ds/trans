@@ -188,5 +188,191 @@ let shader_entries = GraphicsShaderSet {
 
 opengl为大多数阶段提供了默认状态, 而福尔康不同, 必须确定渲染管线的每一步.  
 
-### 顶点输入
+### Render passes
+
+在完成渲染管道的创建之前, 我们需要通知福尔康, 帧缓冲的附件有哪些. 我们需要为帧缓冲区指定颜色和深度缓冲, 以及它们的采样数, 以及如何在渲染操作中处理它们的内容. 
+
+创建颜色附件:  
+
+```
+let color_attachment = Attachment {
+    format: Some(surface_color_format), // 附件的格式
+    samples: 1,                         // 采样数
+    ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store), // 加载和储存操作
+    stencil_ops: AttachmentOps::DONT_CARE,          // 加载和储存模板测试的操作
+    layouts: Layout::Undefined..Layout::Present,    // render pass 最初和最终的图像布局
+};
+```
+
+一个render pass可以由很多个子过程组成, 子过程会根据前面过程中帧缓冲区的内容后续执行操作. 例如一系列相继应用的后处理效果. 将这些渲染操作分到一个render pass, 福尔康可以对内存带宽进行优化.  
+
+每个子过程都会使用一个或者多个附件.  
+
+```
+let subpass = SubpassDesc {
+    colors: &[(0, Layout::ColorAttachmentOptimal)], // 所使用的颜色附件
+    depth_stencil: None,                            // 所使用的深度测试或者模板测试附件
+    inputs: &[],                                    // 将哪个附件作为该子过程的输入
+    resolves: &[],                                  // 用于多重采样的颜色附件
+    preserves: &[],                                 // 此子过程未使用, 但必须保存其数据的附件
+};
+```
+
+多个子过程之间的依赖关系:  
+
+```
+// 这里不太清楚其工作的原理
+let dependency = SubpassDependency {
+    passes: SubpassRef::External..SubpassRef::Pass(0),
+    stages: PipelineStage::COLOR_ATTACHMENT_OUTPUT..PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+    accesses: Access::empty()
+        ..(Access::COLOR_ATTACHMENT_READ | Access::COLOR_ATTACHMENT_WRITE),
+};
+```
+
+接着创建render pass
+
+```
+unsafe {
+    device.create_render_pass(&[color_attachment], &[subpass], &[dependency])
+}.unwrap()
+```
+
+### 管线布局
+
+你可以在着色器中使用uniform变量, 这是一种全局变量, 可以在绘制时使用, 你也可以直接修改它们的值而无需重新创建着色器. 通常用于传递变换矩阵或者纹理. 
+
+push constant是传递值给着色器程序的另一种方式.  
+
+```
+// 着色器所使用的uniform值和push值, 可以在绘制时传递给着色器
+let pipeline_layout = unsafe {
+    device.create_pipeline_layout(&[], &[])
+}.unwrap();
+```
+
+### 创建管道
+
+```
+// 创建图形管道的所有设置的描述
+let mut pipeline_desc = GraphicsPipelineDesc::new(
+    shader_entries,             // 着色器集
+    Primitive::TriangleList,    // 描述了从顶点创建图形的基本类型
+    Rasterizer::FILL,           // 光栅化阶段
+    &pipeline_layout,           // 管道布局
+    subpass,                    // render pass的一个引用
+);
+```
+
+```
+// 这里是做什么用的?
+pipeline_desc
+    .blender
+    .targets
+    .push(ColorBlendDesc(ColorMask::ALL, BlendState::ALPHA));
+```
+
+```
+// 最后创建
+unsafe {
+    device.create_graphics_pipeline(&pipeline_desc, None)
+}.unwrap()
+```
+
+### 帧缓冲
+
+我们已经设置好了渲染过程, 以期望使用与交换链图像相同格式的单个帧缓冲区. 
+
+```
+// 需要为交换链中的每个图像创建帧缓冲区和imageview
+let (frame_views, framebuffers) = match backbuffer {
+    Backbuffer::Images(images) => {
+        // 包含在图像中的资源的子集
+        let color_range = SubresourceRange {
+            // 被包含的种类
+            aspects: Aspects::COLOR,
+            // Included mipmap levels
+            levels: 0..1,
+            // Included array levels
+            layers: 0..1,
+        };
+
+        let image_views = images
+            .iter()
+            .map(|image| {
+                unsafe {
+                    device.create_image_view(
+                        image,                  // 图像
+                        ViewKind::D2,           // 类型
+                        surface_color_format,   // 格式
+                        Swizzle::NO,            // 不懂
+                        color_range.clone(),    // 不懂
+                    )   
+                }.unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let fbos = image_views
+            .iter()
+            .map(|image_view| {
+                unsafe {
+                    device.create_framebuffer(
+                        &render_pass,       
+                        vec![image_view],   // 附件
+                        extent              // 缓冲区尺寸
+                    )
+                }.unwrap()
+            })
+            .collect();
+
+        (image_views, fbos)
+    }
+
+    Backbuffer::Framebuffer(fbo) => (vec![], vec![fbo]),
+};
+```
+
+### 命令缓冲
+
+福尔康中的命令, 如绘制和传输, 不能直接使用函数调用执行, 必须保存到命令缓冲区中. 
+
+### 命令池
+
+我们必须先创建一个命令池, 命令池用于管理存储缓冲区的内存, 并从中分配命令缓冲区.  
+
+命令缓冲区是在一个设备队列上提交来执行的, 比如我们检测到的图形和表示队列. 每个命令池只能分配在单个队列类型上提交的命令缓冲区. 我们将记录绘图命令，这就是为什么我们选择了图形队列族. 
+
+```
+let num_queues = 1;
+let (device, mut queue_group) = adapter
+    .open_with::<_, Graphics>(num_queues, |family| surface.supports_queue_family(family))
+    .unwrap();
+
+let mut command_pool = unsafe {
+    device.create_command_pool_typed(       // 创造一个强类型的命令池
+        &queue_group,                       // 
+        CommandPoolCreateFlags::empty(),)   // 命令池有两种可能的flag:
+// TRANSIENT: 指示命令池经常会使用新的命令, 需要经常进行重新编码
+// RESET_INDIVIDUAL: 运行命令池单独重新编码? 
+}.expect("Can't create command pool");
+```
+
+### 分配命令缓冲区
+
+现在开始分配命令缓冲区, 并在其中提交绘图命令. 我们需要为交换链中的每个图像记录一个命令缓冲区.  
+
+```
+// 分配一个主缓冲区. 
+let mut command_buffer = command_pool.acquire_command_buffer::<gfx_hal::command::MultiShot>();
+```
+
+### 开始
+
+```
+command_buffer.set_viewports(0, &[viewport.clone()]);   // 设置光栅器的视区参数
+command_buffer.set_scissors(0, &[viewport.rect]);       // 设置光栅器的裁剪参数
+
+// Choose a pipeline to use.
+command_buffer.bind_graphics_pipeline(&pipeline);       // 选择使用的渲染管线
+```
 
