@@ -9,7 +9,6 @@
     allow(dead_code, unused_extern_crates, unused_imports)
 )]
 
-extern crate env_logger;
 #[cfg(feature = "dx11")]
 extern crate gfx_backend_dx11 as back;
 #[cfg(feature = "dx12")]
@@ -28,7 +27,7 @@ extern crate winit;
 
 use hal::format::{AsFormat, ChannelType, Rgba8Srgb as ColorFormat, Swizzle};
 use hal::pass::Subpass;
-use hal::pso::{PipelineStage, ShaderStageFlags, VertexInputRate};
+use hal::pso::{PipelineStage, ShaderStageFlags};
 use hal::queue::Submission;
 use hal::{
     buffer, command, format as f, image as i, memory as m, pass, pool, pso, window::Extent2D,
@@ -76,7 +75,6 @@ const COLOR_RANGE: i::SubresourceRange = i::SubresourceRange {
     feature = "gl"
 ))]
 fn main() {
-    env_logger::init();
 
     let mut events_loop = winit::EventsLoop::new();
 

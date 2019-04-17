@@ -31,6 +31,13 @@ const QUAD: [Vertex; 6] = [
     Vertex { a_Pos: [ -0.5,-0.33 ], a_Uv: [0.0, 0.0] },
 ];
 
+const COLOR_RANGE: hal::image::SubresourceRange = hal::image::SubresourceRange {
+    aspects: hal::format::Aspects::COLOR,
+    levels: 0..1,
+    layers: 0..1,
+};
+
+
 fn main() {
     // 首先创建一个物理窗口
     let mut events_loop = winit::EventsLoop::new();
@@ -45,7 +52,7 @@ fn main() {
     // 接着, 创建一个实例: 实例是API的接口
     let instance = backend::Instance::create("first quad", 1);
     // 创建一个表面: 表面是窗口的一种表示
-    let surface = instance.create_surface(&window);
+    let mut surface = instance.create_surface(&window);
     // 创建一组适配器: 适配器表示一个物理设备
     let mut adapters = instance.enumerate_adapters();
     // 打印适配器的信息, 不知道有什么用
@@ -142,7 +149,7 @@ fn main() {
         device.get_buffer_requirements(&vertex_buffer)
     };
     // 获取可用的内存类型
-    let upload_type: hal::adapter::MemoryTypeId = memory_types
+    let upload_type = memory_types
         .iter()
         .enumerate()
         .position(
@@ -180,6 +187,7 @@ fn main() {
         // 释放写映射
         device.release_mapping_writer(vertices).unwrap();
     }
+
 
     // 处理图片, 将图片作为纹理上传到uniform变量中
     // 首先将图片保存为二进制数据
@@ -245,7 +253,6 @@ fn main() {
         }
         device.release_mapping_writer(data).unwrap();
     }
-
     // 下面创建一个纹理
     // 首先创建一个图片对象
     let mut image_logo = unsafe {
@@ -253,7 +260,7 @@ fn main() {
             kind,       // 类型
             1,          // 多级渐远纹理等级
             hal::format::Rgba8Srgb::SELF,   // 格式
-            hal::image::Tiling::Optimal,            // 过滤方式
+            hal::image::Tiling::Optimal,            // 平铺
             hal::image::Usage::TRANSFER_DST | 
                 hal::image::Usage::SAMPLED,         // 使用标记
             hal::image::ViewCapabilities::empty(),  // 不懂
@@ -264,7 +271,7 @@ fn main() {
         device.get_image_requirements(&image_logo)
     };
     // 获取支持图片对象的设备内存的类型
-    let device_type: hal::adapter::MemoryTypeId = memory_types
+    let device_type = memory_types
         .iter()
         .enumerate()
         .position(|(id, memory_type)| {
@@ -278,5 +285,237 @@ fn main() {
             image_req.size)
     }.unwrap();
     // 绑定内存
-    
+    unsafe {
+        device.bind_image_memory(
+            &image_memory,
+            0,
+            &mut image_logo,
+        )
+    }.unwrap();
+    // 使用一张已有的图片创建一个image view
+    let image_srv = unsafe {
+        device.create_image_view(
+            &image_logo,                    // 源图像
+            hal::image::ViewKind::D2,       // 类型
+            hal::format::Rgba8Srgb::SELF,   // 格式
+            hal::format::Swizzle::NO,       // 是否将图像映射为其他格式
+            COLOR_RANGE.clone(),            // 这个参数有什么用
+        )
+    }.unwrap();
+    // 创建一个采样器对象
+    let sampler = unsafe {
+        device.create_sampler(
+            hal::image::SamplerInfo::new(
+                hal::image::Filter::Linear, // 设置采样纹理的过滤方式 
+                hal::image::WrapMode::Clamp,
+            )
+        )
+    }.expect("Cannot create sampler");
+    // 指定描述符集的写入操作的参数
+    unsafe {
+        device.write_descriptor_sets(vec![
+            // 将要绑定的实际描述符写入描述符集合
+            hal::pso::DescriptorSetWrite {
+                set: &desc_set,
+                binding: 0,
+                array_offset: 0,
+                descriptors: Some(
+                    hal::pso::Descriptor::Image(&image_srv, hal::image::Layout::Undefined)
+                ),
+            },
+            hal::pso::DescriptorSetWrite {
+                set: &desc_set,
+                binding: 1,
+                array_offset: 0,
+                descriptors: Some(
+                    hal::pso::Descriptor::Sampler(&sampler)
+                ),
+            }
+        ]);
+    }
+    // 将缓冲区复制到纹理中
+    // 首先创建一个fence信号. 
+    let mut copy_fence = device.create_fence(false).expect("Cannot create fence");
+    unsafe {
+        // 创建一个只用一次的命令缓冲
+        let mut cmd_buffer = command_pool.acquire_command_buffer::<hal::command::OneShot>();
+        // 开始记录命令缓冲
+        cmd_buffer.begin();
+        // 为图片创建一个内存屏障
+        // 内存屏障在移动或修改内存时使用, 具体用处还不知道
+        let image_barrier: hal::memory::Barrier<backend::Backend> = hal::memory::Barrier::Image {
+            states: (hal::image::Access::empty(), hal::image::Layout::Undefined)
+                ..(hal::image::Access::TRANSFER_WRITE, hal::image::Layout::TransferDstOptimal),
+            target: &image_logo,
+            families: None,
+            range: COLOR_RANGE.clone(),
+        };
+        // 在命令缓冲区的管道阶段之间插入同步依赖项
+        cmd_buffer.pipeline_barrier(
+            hal::pso::PipelineStage::TOP_OF_PIPE
+                ..hal::pso::PipelineStage::TRANSFER,
+            hal::memory::Dependencies::empty(),
+            &[image_barrier],
+        );
+        // 从缓冲区复制内容到图片
+        cmd_buffer.copy_buffer_to_image(
+            &image_upload_buffer,   // 源
+            &image_logo,            // 目标
+            hal::image::Layout::TransferDstOptimal, // 目标布局
+            &[hal::command::BufferImageCopy {   // 指定复制缓冲区到图片的所有参数
+                buffer_offset: 0,
+                buffer_width: row_pitch / (image_stride as u32),
+                buffer_height: height as u32,
+                image_layers: hal::image::SubresourceLayers {
+                    aspects: hal::format::Aspects::COLOR,
+                    level: 0,
+                    layers: 0..1,
+                },
+                image_offset: hal::image::Offset {
+                    x: 0, 
+                    y: 0, 
+                    z: 0
+                },
+                image_extent: hal::image::Extent {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            }],
+        );
+        // 然后再把图片上传到着色器
+        let image_barrier: hal::memory::Barrier<backend::Backend> = hal::memory::Barrier::Image {
+            states: (hal::image::Access::TRANSFER_WRITE, hal::image::Layout::TransferDstOptimal)
+                ..(hal::image::Access::SHADER_READ, hal::image::Layout::ShaderReadOnlyOptimal),
+            target: &image_logo,
+            families: None,
+            range: COLOR_RANGE.clone(),
+        };
+        cmd_buffer.pipeline_barrier(
+            hal::pso::PipelineStage::TRANSFER
+                ..hal::pso::PipelineStage::FRAGMENT_SHADER,
+            hal::memory::Dependencies::empty(),
+            &[image_barrier],
+        );
+        // 完成命令记录
+        cmd_buffer.finish();
+        // 将命令缓冲区提交到队列族中
+        queue_group.queues[0].submit_nosemaphores(
+            Some(&cmd_buffer), 
+            Some(&mut copy_fence),
+        );
+        device 
+            .wait_for_fence(&copy_fence, !0)    // 等待命令执行完毕
+            .expect("Cannot wait for fence");
+    }
+    // 删除fence信号
+    unsafe {
+        device.destroy_fence(copy_fence);
+    }
+
+
+    // 获取surface兼容性和surface的格式
+    let (caps, formats, _present_modes, _composite_alpha) = 
+        surface.compatibility(&mut adapter.physical_device);
+    // 打印
+    println!("formats: {:?}", formats);
+    // 从所有支持的格式中, 选择srgb格式
+    let format = formats.map_or(
+        hal::format::Format::Rgba8Srgb,
+        |formats| {
+            formats
+                .iter()
+                .find(
+                    |format| format.base_format().1 == hal::format::ChannelType::Srgb
+                ).map(|format| *format)
+                .unwrap_or(formats[0])
+        }
+    );
+    // 创建交换链配置
+    let swap_config = hal::window::SwapchainConfig::from_caps(
+        &caps, 
+        format, 
+        DIMS
+    );
+    println!("{:?}", swap_config);
+    // 获取交换区图像尺寸
+    let extent = swap_config.extent.to_extent();
+    // 创建交换链和backbuffer
+    let (mut swap_chain, mut backbuffer) = unsafe {
+        device.create_swapchain(
+            &mut surface,
+            swap_config,
+            None,
+        )
+    }.expect("Cannot create swapchain");
+    // 创建renderpass
+    let render_pass = {
+        // 首先创建一个附件
+        let attachment = hal::pass:Attachment {
+            format: Some(format),
+            samples: 1,
+            ops: hal::pass::AttachmentOps::new(
+                hal::pass::AttachmentLoadOp::Clear,
+                hal::pass::AttachmentStoreOp::Store,
+            ),
+            stencil_ops: hal::pass::AttachmentOps::DONT_CARE,
+            layout: hal::image::Layout::Undefined
+                ..hal::image::Layout::Present,
+        };
+        // 创建一个子过程
+        let subpass = hal::pass::SubpassDesc {
+            colors: &[(0, hal::image::Layout::ColorAttachmentOptimal)],
+            depth_stencil: None,
+            inputs: &[],
+            resolves: &[],
+            preserves: &[],
+        };
+        // 接着, 指定多个子过程之间的依赖关系
+        let dependency = hal::pass::SubpassDependency {
+            passes: hal::pass::SubpassRef::External
+                ..hal::pass::SubpassRef::Pass(0),
+            stages: hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+                ..pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+            accesses: hal::image::Access::empty()
+                ..(hal::image::Access::COLOR_ATTACHMENT_READ | hal::imgae::Access::COLOR_ATTACHMENT_WRITE),
+        };
+        // 最后, 创建render pass
+        unsafe {
+            device.create_render_pass(
+                &[attachment],
+                &[subpass],
+                &[dependency],
+            )
+        }.expect("Cannot create render pass")
+    };
+    // 给交换链中的每个图像创建一个imgaeview和帧缓冲
+    let (mut frame_images, mut framebuffers) = match backbuffer {
+        hal::Backbuffer::Images(images) => {
+            let pairs = images
+                .into_iter()
+                .map(|image| unsafe {
+                    let rtv = device.create_image_view(
+                        &image,
+                        hal::image::ViewKind::D2,
+                        format,
+                        hal::format::Swizzle::NO,
+                        COLOR_RANGE.clone(),
+                    ).unwrap();
+                    (image, rtv)
+                })
+                .collect::<Vec<_>>();
+            let fbos = pairs
+                .iter()
+                .map(|&(_, ref rtv)| unsafe {
+                    device.create_framebuffer(
+                        &render_pass, 
+                        Some(rtv),
+                        extent
+                    ).unwrap()
+                })
+                .collect();
+            (pairs, fbos)
+        }
+        hal::Backbuffer::Framebuffer(fbo) => (Vec::new(), vec![fbo]),
+    };
 }
