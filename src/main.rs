@@ -12,6 +12,9 @@ use hal::window::Surface;
 use hal::device::Device;
 use hal::pso::DescriptorPool;
 use hal::format::AsFormat;
+use hal::window::Swapchain;
+
+use std::io::Read;
 
 // 顶点结构体
 #[derive(Debug, Clone, Copy)]
@@ -451,7 +454,7 @@ fn main() {
     // 创建renderpass
     let render_pass = {
         // 首先创建一个附件
-        let attachment = hal::pass:Attachment {
+        let attachment = hal::pass::Attachment {
             format: Some(format),
             samples: 1,
             ops: hal::pass::AttachmentOps::new(
@@ -459,7 +462,7 @@ fn main() {
                 hal::pass::AttachmentStoreOp::Store,
             ),
             stencil_ops: hal::pass::AttachmentOps::DONT_CARE,
-            layout: hal::image::Layout::Undefined
+            layouts: hal::image::Layout::Undefined
                 ..hal::image::Layout::Present,
         };
         // 创建一个子过程
@@ -475,9 +478,9 @@ fn main() {
             passes: hal::pass::SubpassRef::External
                 ..hal::pass::SubpassRef::Pass(0),
             stages: hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT
-                ..pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+                ..hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
             accesses: hal::image::Access::empty()
-                ..(hal::image::Access::COLOR_ATTACHMENT_READ | hal::imgae::Access::COLOR_ATTACHMENT_WRITE),
+                ..(hal::image::Access::COLOR_ATTACHMENT_READ | hal::image::Access::COLOR_ATTACHMENT_WRITE),
         };
         // 最后, 创建render pass
         unsafe {
@@ -518,4 +521,312 @@ fn main() {
         }
         hal::Backbuffer::Framebuffer(fbo) => (Vec::new(), vec![fbo]),
     };
+
+
+    // 设置可以同时计算渲染的帧数
+    let frames_in_flight = 3;
+    // 设置图像采集信号量, 其个数为交换链中图像数量
+    let mut image_acquire_semaphores = Vec::with_capacity(frame_images.len());
+    // 创建信号: 
+    let mut free_acquire_semaphore = device
+        .create_semaphore()
+        .expect("Cannot create semaphore");
+    // 创建信号: 
+    let mut submission_complete_semaphores = Vec::with_capacity(frames_in_flight);
+    let mut submission_complete_fences = Vec::with_capacity(frames_in_flight);
+    // 在真实的用例中, 通常认为每帧每个线程配置一个命令池是最佳的
+    // 因为默认只能重置每个命令池, 因此一个命令池对应一个命令缓冲, 对应一帧是最佳选择
+    let mut cmd_pools = Vec::with_capacity(frames_in_flight);
+    let mut cmd_buffers = Vec::with_capacity(frames_in_flight);
+    cmd_pools.push(command_pool);
+    // 创建内存池组剩下的内存池
+    for _ in 1..frames_in_flight {
+        unsafe {
+            cmd_pools.push(
+                device.create_command_pool_typed(
+                    &queue_group,
+                    hal::pool::CommandPoolCreateFlags::empty(), // 优先考虑效率, 这里始终设置为空
+                ).expect("Cannot create command pool"),
+            );
+        }
+    }
+    // 创建信号, 加入组
+    for _ in 0..frame_images.len() {
+        image_acquire_semaphores.push(
+            device.create_semaphore().expect("Cannot create semaphore"),
+        )
+    }
+    for i in 0..frames_in_flight {
+        submission_complete_semaphores.push(
+            device.create_semaphore().expect("Cannot create semaphore"),
+        );
+        submission_complete_fences.push(
+            device.create_fence(true)   // 初始为有信号
+            .expect("Cannot create semaphore"),
+        );
+        cmd_buffers.push(
+            // 为每个帧创建一个命令缓冲, 命令缓冲可以提交多次
+            cmd_pools[i].acquire_command_buffer::<hal::command::MultiShot>()
+        );
+    }
+    // 创建管道布局对象
+    let pipeline_layout = unsafe {
+        device.create_pipeline_layout(
+            std::iter::once(&set_layout),   // 描述符集合布局
+            // 推送常数的范围, 一个着色器阶段只能包含一个push常量块
+            // 范围的长度表示push常量块所占用的u32常量的数量
+            &[(hal::pso::ShaderStageFlags::VERTEX, 0..8)],
+        )
+    }.expect("Cannot create pipeline layout");
+    // 创建渲染管线
+    let pipeline = {
+        // 创建顶点着色器模块
+        // 使用g_to_s模块将glsl文件编译成spirv文件
+        let vs_module = {
+            let glsl = std::fs::read_to_string("src/data/quad.vert")
+                .expect("Cannot open quad.vert");
+            let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Vertex)
+                .unwrap()
+                .bytes()
+                .map(|b| b.unwrap())
+                .collect();
+            unsafe { device.create_shader_module(&spirv) }.unwrap()
+        };
+        // 片段着色器同理
+        let fs_module = {
+            let glsl = std::fs::read_to_string("src/data/quad.frag")
+                .expect("Cannot open quad.frag");
+            let spirv: Vec<u8> = glsl_to_spirv::compile(&glsl, glsl_to_spirv::ShaderType::Fragment)
+                .unwrap()
+                .bytes()
+                .map(|b| b.unwrap())
+                .collect();
+            unsafe { device.create_shader_module(&spirv) }.unwrap()
+        };
+        let pipeline = {
+            // 创建着色器入口
+            let vs_entry = hal::pso::EntryPoint {
+                entry: ENTRY_NAME,
+                module: &vs_module,
+                specialization: hal::pso::Specialization {
+                    constants: &[hal::pso::SpecializationConstant {
+                        id: 0,
+                        range: 0..4,
+                    }],
+                    data: unsafe {
+                        std::mem::transmute::<&f32, &[u8; 4]>(&0.8f32)
+                    },
+                },
+            };
+            let fs_entry = hal::pso::EntryPoint {
+                entry: ENTRY_NAME,
+                module: &fs_module,
+                specialization: hal::pso::Specialization::default(),
+            };
+            // 着色器集合
+            let shader_entries = hal::pso::GraphicsShaderSet {
+                vertex: vs_entry,
+                hull: None,
+                domain: None,
+                geometry: None,
+                fragment: Some(fs_entry),
+            };
+            // 设置管线的render pass
+            let subpass = hal::pass::Subpass {
+                index: 0,
+                main_pass: &render_pass,
+            };
+            // 创建一个管道状态对象描述器
+            let mut pipeline_desc = hal::pso::GraphicsPipelineDesc::new(
+                shader_entries,
+                hal::Primitive::TriangleList,
+                hal::pso::Rasterizer::FILL,     // 光栅化状态
+                &pipeline_layout,
+                subpass,
+            );
+            // 设置颜色混合模式
+            pipeline_desc.blender.targets.push(hal::pso::ColorBlendDesc(
+                hal::pso::ColorMask::ALL,
+                hal::pso::BlendState::ALPHA,
+            ));
+            // 顶点缓冲描述器
+            pipeline_desc.vertex_buffers.push(hal::pso::VertexBufferDesc {
+                binding: 0, // 此描述器的绑定号
+                stride: std::mem::size_of::<Vertex>() as u32,   // 每个元素的宽度
+                rate: 0,
+            });
+            // pso顶点attribute描述器
+            pipeline_desc.attributes.push(hal::pso::AttributeDesc {
+                location: 0,
+                binding: 0,
+                element: hal::pso::Element {
+                    format: hal::format::Format::Rg32Float,
+                    offset: 0,
+                },
+            });
+            pipeline_desc.attributes.push(hal::pso::AttributeDesc {
+                location: 1,
+                binding: 0,
+                element: hal::pso::Element {
+                    format: hal::format::Format::Rg32Float,
+                    offset: 8,
+                },
+            });
+            unsafe {
+                device.create_graphics_pipeline(&pipeline_desc, None)
+            }
+        };
+        // 销毁着色器模块
+        unsafe {
+            device.destroy_shader_module(vs_module);
+        }
+        unsafe {
+            device.destroy_shader_module(fs_module);
+        }
+        pipeline.unwrap()
+    };
+    // 设置视口
+    let mut viewport = hal::pso::Viewport {
+        rect: hal::pso::Rect {
+            x: 0,
+            y: 0,
+            w: extent.width as _,
+            h: extent.height as _,
+        },
+        depth: 0.0..1.0,
+    };
+    let mut running = true;
+    let mut frame: u64 = 0;
+    while running {
+        // 事件循环, 主要是winit包
+        events_loop.poll_events(|event| {
+            if let winit::Event::WindowEvent {event, ..} = event {
+                #[allow(unused_variables)]
+                match event {
+                    winit::WindowEvent::KeyboardInput {
+                        input:
+                            winit::KeyboardInput {
+                                virtual_keycode: Some(winit::VirtualKeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    }
+                    | winit::WindowEvent::CloseRequested => running = false,
+                    _ => (),
+                }
+            }
+        });
+        // 使用acquire_image函数, 用未使用的获取信号来获得即将渲染的下一帧图像的索引
+        let swap_image = unsafe {
+            match swap_chain.acquire_image(
+                !0, 
+                hal::window::FrameSync::Semaphore(&free_acquire_semaphore),
+            ) {
+                Ok(i) => i as usize,
+                Err(_) => {
+                    continue;
+                }
+            }
+        };
+        // 将获取信号与我们正在获取的图像关联的信号交换
+        std::mem::swap(
+            &mut free_acquire_semaphore, 
+            &mut image_acquire_semaphores[swap_image],
+        );
+
+        let frame_idx = frame as usize % frames_in_flight;
+        unsafe {
+            device.wait_for_fence(
+                &submission_complete_fences[frame_idx],
+                !0,
+            ).expect("Failed to wait for fence");
+            device.reset_fence(
+                &submission_complete_fences[frame_idx],
+            ).expect("Failed to reset fence");
+            cmd_pools[frame_idx].reset();
+        }
+        // 开始渲染
+        let cmd_buffer = &mut cmd_buffers[frame_idx];
+        unsafe {
+            cmd_buffer.begin(false);
+            cmd_buffer.set_viewports(0, &[viewport.clone()]);
+            cmd_buffer.set_scissors(0, &[viewport.rect]);
+            cmd_buffer.bind_graphics_pipeline(&pipeline);
+            cmd_buffer.bind_vertex_buffers(0, Some((&vertex_buffer, 0)));
+            cmd_buffer.bind_graphics_descriptor_sets(&pipeline_layout, 0, Some(&desc_set), &[]);
+
+            {
+                let mut encoder = cmd_buffer.begin_render_pass_inline(
+                    &render_pass,
+                    &framebuffers[swap_image],
+                    viewport.rect,
+                    &[hal::command::ClearValue::Color(hal::command::ClearColor::Float([
+                        0.8, 0.8, 0.8, 1.0,
+                    ]))],
+                );
+                encoder.draw(0..6, 0..1);
+            }
+
+            cmd_buffer.finish();
+
+            let submission = hal::queue::Submission {
+                command_buffers: Some(&*cmd_buffer),
+                wait_semaphores: Some((
+                    &image_acquire_semaphores[swap_image],
+                    hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+                )),
+                signal_semaphores: Some(&submission_complete_semaphores[frame_idx]),
+            };
+            queue_group.queues[0].submit(submission, Some(&submission_complete_fences[frame_idx]));
+        
+            if let Err(_) = swap_chain.present(
+                &mut queue_group.queues[0],
+                swap_image as hal::SwapImageIndex,
+                Some(&submission_complete_semaphores[frame_idx]),
+            ) {
+            }
+        }
+
+        frame += 1;
+    }
+
+    // 清理
+    device.wait_idle().unwrap();
+    unsafe {
+        device.destroy_descriptor_pool(desc_pool);
+        device.destroy_descriptor_set_layout(set_layout);
+
+        device.destroy_buffer(vertex_buffer);
+        device.destroy_buffer(image_upload_buffer);
+        device.destroy_image(image_logo);
+        device.destroy_image_view(image_srv);
+        device.destroy_sampler(sampler);
+        device.destroy_semaphore(free_acquire_semaphore);
+        for p in cmd_pools {
+            device.destroy_command_pool(p.into_raw());
+        }
+        for s in image_acquire_semaphores {
+            device.destroy_semaphore(s);
+        }
+        for s in submission_complete_semaphores {
+            device.destroy_semaphore(s);
+        }
+        for f in submission_complete_fences {
+            device.destroy_fence(f);
+        }
+        device.destroy_render_pass(render_pass);
+        device.free_memory(buffer_memory);
+        device.free_memory(image_memory);
+        device.free_memory(image_upload_memory);
+        device.destroy_graphics_pipeline(pipeline);
+        device.destroy_pipeline_layout(pipeline_layout);
+        for framebuffer in framebuffers {
+            device.destroy_framebuffer(framebuffer);
+        }
+        for (_, rtv) in frame_images {
+            device.destroy_image_view(rtv);
+        }
+
+        device.destroy_swapchain(swap_chain);
+    }
 }
