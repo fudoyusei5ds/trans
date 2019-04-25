@@ -25,138 +25,63 @@
 
 你需要创建一个窗口来展示你所渲染的图像, 除非你只关心离屏渲染. 你可以使用你喜欢的API来创建窗口. 创建窗口的部分和福尔康无关.   
 
-Note the `KHR` postfix, which
-means that these objects are part of a Vulkan extension. The Vulkan API itself
-is completely platform agnostic, which is why we need to use the standardized
-WSI (Window System Interface) extension to interact with the window manager. The
-surface is a cross-platform abstraction over windows to render to and is
-generally instantiated by providing a reference to the native window handle, for
-example `HWND` on Windows. Luckily, the GLFW library has a built-in function to
-deal with the platform specific details of this.
-在渲染图像到窗口的过程中, 你需要另外两个组建: 窗口surface以及交换链. 福尔康本身不依赖于平台. surface是窗口上的跨平台的抽象
+在渲染图像到窗口的过程中, 你需要另外两个组建: 窗口surface以及交换链. 福尔康本身不依赖于平台. surface是窗口上的跨平台的抽象.  
 
-The swap chain is a collection of render targets. Its basic purpose is to ensure
-that the image that we're currently rendering to is different from the one that
-is currently on the screen. This is important to make sure that only complete
-images are shown. Every time we want to draw a frame we have to ask the swap
-chain to provide us with an image to render to. When we've finished drawing a
-frame, the image is returned to the swap chain for it to be presented to the
-screen at some point. The number of render targets and conditions for presenting
-finished images to the screen depends on the present mode. Common present modes
-are  double buffering (vsync) and triple buffering. We'll look into these in the
-swap chain creation chapter.
+交换链是一系列渲染对象的集合. 它的作用在于确保我们正在渲染的图像和正在屏幕上显示的图像不同. 每当我们想绘制一帧图像, 我们必须要求交换链提供给我们一个要渲染的图像. 当绘制完一帧之后, 图像将返回交换链中, 用以在未来某个时刻显示到屏幕上. 渲染对象的数量和将渲染完成的图像显示到屏幕上的条件取决于交换链的显示模式. 常用的显示模式有双缓冲(垂直同步)以及三重缓冲. 我们将在之后详细介绍这些东西.  
 
-Some platforms allow you to render directly to a display without interacting with any window manager through the `VK_KHR_display` and `VK_KHR_display_swapchain` extensions. These allow you to create a surface that represents the entire screen and could be used to implement your own window manager, for example.
+有些平台允许你直接渲染到显示器上(display), 而不需要与任何窗口管理器交互. 你可以通过这种方式创建一个覆盖整个屏幕的surface, 然后通过这种方式实现一个自己的窗口管理器.  
 
-### Step 4 - Image views and framebuffers
+### 步骤4 - 图像视图和帧缓冲
 
-To draw to an image acquired from the swap chain, we have to wrap it into a
-VkImageView and VkFramebuffer. An image view references a specific part of an
-image to be used, and a framebuffer references image views that are to be used
-for color, depth and stencil targets. Because there could be many different
-images in the swap chain, we'll preemptively create an image view and
-framebuffer for each of them and select the right one at draw time.
+为了绘制从交换链中获取的图像, 我们必须把它包装成图像视图和帧缓冲. 图像视图是指使用的图像的某部分, 帧缓冲则是将用于颜色, 深度, 模板目标的图像视图. 因为在交换链中的图像各不相同, 我们必须为交换链中的每个图像分别创建一个图像视图和帧缓冲. 在渲染的时候, 选择正确的图像视图和帧缓冲.  
 
-### Step 5 - Render passes
 
-Render passes in Vulkan describe the type of images that are used during
-rendering operations, how they will be used, and how their contents should be
-treated. In our initial triangle rendering application, we'll tell Vulkan that
-we will use a single image as color target and that we want it to be cleared
-to a solid color right before the drawing operation. Whereas a render pass only
-describes the type of images, a VkFramebuffer actually binds specific images to
-these slots.
+### 步骤5 - render passes
 
-### Step 6 - Graphics pipeline
+render passes 用来描述在渲染操作时使用的图像的类型, 以及它们是如何被使用的, 以及如何处理它们的内容. 在入门的三角形应用中, 我们告诉福尔康我们将使用单个图像作为颜色目标, 并且在绘制操作执行之前, 我们将其清理为某个纯色的背景. 虽然 render passes 只描述图像的类型, 不过帧缓冲实际上将特定图像绑定到这些插槽上.  
 
-The graphics pipeline in Vulkan is set up by creating a VkPipeline object. It
-describes the configurable state of the graphics card, like the viewport size
-and depth buffer operation and the programmable state using VkShaderModule
-objects. The VkShaderModule objects are created from shader byte code. The
-driver also needs to know which render targets will be used in the pipeline,
-which we specify by referencing the render pass.
+### 步骤6 - 图形管线
 
-One of the most distinctive features of Vulkan compared to existing APIs, is
-that almost all configuration of the graphics pipeline needs to be set in advance.
-That means that if you want to switch to a different shader or slightly
-change your vertex layout, then you need to entirely recreate the graphics
-pipeline. That means that you will have to create many VkPipeline objects in
-advance for all the different combinations you need for your rendering
-operations. Only some basic configuration, like viewport size and clear color,
-can be changed dynamically. All of the state also needs to be described
-explicitly, there is no default color blend state, for example.
+渲染管线描述了显卡的可配置状态, 例如视口尺寸和深度缓冲操作以及可编程阶段的着色器模块. 着色器模块是从着色器二进制代码中创建的. 驱动同时需要知道哪个渲染对象将在管线中被使用. 我们通过上面的 render pass 来指定.  
 
-The good news is that because you're doing the equivalent of ahead-of-time
-compilation versus just-in-time compilation, there are more optimization
-opportunities for the driver and runtime performance is more predictable,
-because large state changes like switching to a different graphics pipeline are
-made very explicit.
+与现有的API相比, 福尔康最显著的特点是, 图形管线的所有可配置状态都需要手动进行设置. 这也意味着如果你想切换不同的着色器或者只是想修改顶点布局, 你都必须完整地重建整个图形管线对象. 只有一些基础的设置, 例如视口尺寸和清理颜色, 可以被动态修改. 所有的状态都要明确指定, 福尔康并不会为其提供默认值.  
 
-### Step 7 - Command pools and command buffers
+这样的好处在于, 方便优化.  
 
-As mentioned earlier, many of the operations in Vulkan that we want to execute,
-like drawing operations, need to be submitted to a queue. These operations first
-need to be recorded into a VkCommandBuffer before they can be submitted. These
-command buffers are allocated from a `VkCommandPool` that is associated with a
-specific queue family. To draw a simple triangle, we need to record a command
-buffer with the following operations:
+### 步骤7 - 命令池和命令缓冲
 
-* Begin the render pass
-* Bind the graphics pipeline
-* Draw 3 vertices
-* End the render pass
+正如之前提到的, 我们想在福尔康中进行的诸多操作, 例如绘制, 都需要提交到一个队列中. 在提交之前, 这些命令首先需要被记录到命令缓冲中. 命令缓冲从命令池中分配, 而命令池则与特定的队列族相互关联. 为了绘制一个简单的三角形, 我们需要在命令缓冲中记录下如下命令:  
 
-Because the image in the framebuffer depends on which specific image the swap
-chain will give us, we need to record a command buffer for each possible image
-and select the right one at draw time. The alternative would be to record the
-command buffer again every frame, which is not as efficient.
+* 启动 render pass
+* 绑定图形管线
+* 绘制3个顶点
+* 结束 render pass
 
-### Step 8 - Main loop
+因为在帧缓冲中的图像取决于交换链给我们什么样的图像, 因此, 我们需要为每个可能的图像都记录一个命令缓冲, 然后再绘制时选择正确的命令缓冲. 另一个方法是, 再每一帧时重新记录命令缓冲区, 不过这个办法效率不高.  
 
-Now that the drawing commands have been wrapped into a command buffer, the main
-loop is quite straightforward. We first acquire an image from the swap chain
-with vkAcquireNextImageKHR. We can then select the appropriate command buffer
-for that image and execute it with vkQueueSubmit. Finally, we return the image
-to the swap chain for presentation to the screen with vkQueuePresentKHR.
+### 步骤8 - 主循环
 
-Operations that are submitted to queues are executed asynchronously. Therefore
-we have to use synchronization objects like semaphores to ensure a correct
-order of execution. Execution of the draw command buffer must be set up to wait
-on image acquisition to finish, otherwise it may occur that we start rendering
-to an image that is still being read for presentation on the screen. The
-vkQueuePresentKHR call in turn needs to wait for rendering to be finished, for
-which we'll use a second semaphore that is signaled after rendering completes.
+现在, 绘制命令已经被包装为了命令缓冲, 主循环的结构就很清晰了. 我们首先从交换链中获取一张图像, 然后为该图像选择合适的命令缓冲, 提交并执行命令. 最后, 我们将图像返回给交换链, 交换链再将图像展示到屏幕上.  
+ 
+提交到队列的操作将被异步执行. 因此我们必须使用像信号量这样的同步对象来确保指令的执行顺序正确. 只有等到图像获取操作完成之后, 才能执行绘制操作, 否则我们会把之前渲染完要显示到屏幕上的图像再渲染一次. 而屏幕显示这个操作需要等待渲染操作完成, 因此我们使用第二个信号量, 该信号量将在渲染完成后发出信号.  
 
-### Summary
+### 总结
 
-This whirlwind tour should give you a basic understanding of the work ahead for
-drawing the first triangle. A real-world program contains more steps, like
-allocating vertex buffers, creating uniform buffers and uploading texture images
-that will be covered in subsequent chapters, but we'll start simple because
-Vulkan has enough of a steep learning curve as it is. Note that we'll cheat a
-bit by initially embedding the vertex coordinates in the vertex shader instead
-of using a vertex buffer. That's because managing vertex buffers requires some
-familiarity with command buffers first.
+本章对福尔康的快速浏览将会让你对未来如何绘制一个三角形有个基础的认识. 一个真实的应用将会包含更多步骤, 例如分配顶点缓冲, 创建uniform缓冲, 以及上传纹理图片, 这些都将在未来的章节中介绍, 不过现在还是简单些好吗因为福尔康的学习曲线过于陡峭. 注意, 我们将要写的三角形程序所使用的顶点将直接写在顶点着色器中, 而不是使用顶点缓冲区. 这是因为学习有关顶点缓冲区的管理的内容首先要对命令缓冲很熟悉.  
 
-So in short, to draw the first triangle we need to:
+简单来说, 为了绘制第一个三角形, 我们需要:  
 
-* Create a VkInstance
-* Select a supported graphics card (VkPhysicalDevice)
-* Create a VkDevice and VkQueue for drawing and presentation
-* Create a window, window surface and swap chain
-* Wrap the swap chain images into VkImageView
-* Create a render pass that specifies the render targets and usage
-* Create framebuffers for the render pass
-* Set up the graphics pipeline
-* Allocate and record a command buffer with the draw commands for every possible
-swap chain image
-* Draw frames by acquiring images, submitting the right draw command buffer and
-returning the images back to the swap chain
-
-It's a lot of steps, but the purpose of each individual step will be made very
-simple and clear in the upcoming chapters. If you're confused about the relation
-of a single step compared to the whole program, you should refer back to this
-chapter.
+* 创建实例
+* 选择支持的显卡
+* 创建逻辑设备和队列
+* 创建物理窗口, 逻辑窗口和交换链
+* 将交换链图像包装为图像视图
+* 创建render pass, 指定渲染对象和用法
+* 为render pass 创建帧缓冲
+* 设置图形管线
+* 分配并记录命令缓冲
+* 交换交换链
+* 获取图像, 提交命令开始绘制, 绘制完成后将图像返回交换链并展示
 
 ## API concepts
 
